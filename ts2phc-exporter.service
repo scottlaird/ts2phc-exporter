@@ -1,0 +1,12 @@
+[Unit]
+Description=ts2phc Exporter
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/ts2phc-exporter
+KillMode=process
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
