@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 
+	"github.com/hpcloud/tail"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -16,8 +17,10 @@ import (
 )
 
 var (
-	debug         = flag.Bool("debug", false, "Enable debugging output")
-	listenAddress = flag.String("listen_address", ":8089", "Which HTTP port/address to listen on")
+	debug          = flag.Bool("debug", false, "Enable debugging output")
+	listenAddress  = flag.String("listen_address", ":8089", "Which HTTP port/address to listen on")
+	journalctlUnit = flag.String("u", "ts2phc", "Systemd journal unit to read for ts2phc logs")
+	logfile        = flag.String("logfile", "", "Logfile to read for ts2phc logs (overrides journalctl default)")
 
 	nemaRE   = regexp.MustCompile(".*nmea sentence: (.*)")
 	offsetRE = regexp.MustCompile(".*(/dev/ptp[0-9]+) offset +([-0-9]+) .* freq +([-+0-9]+)")
@@ -184,47 +187,65 @@ func main() {
 }
 
 func ReadLogs() {
-	slog.Info("Scanning ts2phc logs")
-	cmd := exec.Command("journalctl", "-u", "ts2phc", "-f")
-
-	logs, err := cmd.StdoutPipe()
-	if err != nil {
-		slog.Error("Failed to create journalctl pipe", "error", err)
-		return
-	}
-
-	err = cmd.Start()
-	if err != nil {
-		slog.Error("Failed to run journalctl", "error", err)
-		return
-	}
-
-	scanner := bufio.NewScanner(logs)
-
+	var scanner *bufio.Scanner
 	nd := &parser.NMEAData{}
 	ResetNMEAData(nd)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		slog.Debug("Scanning line", "line", line)
+	if *logfile != "" {
+		t, err := tail.TailFile(*logfile, tail.Config{Follow: true})
+		if err != nil {
+			slog.Error("Unable to open logfile", "error", err, "logfile", *logfile)
+			return
+		}
+		slog.Info("Scanning logfile", "logfile", *logfile)
 
-		if nmeaMatch := nemaRE.FindStringSubmatch(line); nmeaMatch != nil {
-			parser.ParseNMEALogEntry(nmeaMatch[1], nd)
-		} else if offsetMatch := offsetRE.FindStringSubmatch(line); offsetMatch != nil {
-			slog.Debug("Offset", "device", offsetMatch[1], "offset", offsetMatch[2], "freq", offsetMatch[3])
-
-			nd.Device = offsetMatch[1]
-			nd.Offset, _ = strconv.Atoi(offsetMatch[2])
-			nd.Freq, _ = strconv.Atoi(offsetMatch[3])
-
-			PublishNMEAData(nd)
-			ResetNMEAData(nd)
-		} else {
-			if *debug {
-				slog.Debug("Unknown log line", "line", line)
-			}
+		for line := range t.Lines {
+			ParseLine(line.Text, nd)
 		}
 
+	} else {
+		cmd := exec.Command("journalctl", "-u", *journalctlUnit, "-f")
+
+		logs, err := cmd.StdoutPipe()
+		if err != nil {
+			slog.Error("Failed to create journalctl pipe", "error", err)
+			return
+		}
+
+		err = cmd.Start()
+		if err != nil {
+			slog.Error("Failed to run journalctl", "error", err)
+			return
+		}
+		slog.Info("Scanning ts2phc logs", "unit", *journalctlUnit)
+
+		scanner = bufio.NewScanner(logs)
+		for scanner.Scan() {
+			line := scanner.Text()
+			ParseLine(line, nd)
+		}
 	}
+
 	slog.Error("scan loop finished")
+}
+
+func ParseLine(line string, nd *parser.NMEAData) {
+	slog.Debug("Scanning line", "line", line)
+
+	if nmeaMatch := nemaRE.FindStringSubmatch(line); nmeaMatch != nil {
+		parser.ParseNMEALogEntry(nmeaMatch[1], nd)
+	} else if offsetMatch := offsetRE.FindStringSubmatch(line); offsetMatch != nil {
+		slog.Debug("Offset", "device", offsetMatch[1], "offset", offsetMatch[2], "freq", offsetMatch[3])
+
+		nd.Device = offsetMatch[1]
+		nd.Offset, _ = strconv.Atoi(offsetMatch[2])
+		nd.Freq, _ = strconv.Atoi(offsetMatch[3])
+
+		PublishNMEAData(nd)
+		ResetNMEAData(nd)
+	} else {
+		if *debug {
+			slog.Debug("Unknown log line", "line", line)
+		}
+	}
 }
