@@ -4,6 +4,7 @@ go 1.23.2
 
 require (
 	github.com/adrianmo/go-nmea v1.10.0
+	github.com/hpcloud/tail v1.0.0
 	github.com/prometheus/client_golang v1.22.0
 )
 
@@ -16,4 +17,6 @@ require (
 	github.com/prometheus/procfs v0.15.1 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 	google.golang.org/protobuf v1.36.5 // indirect
+	gopkg.in/fsnotify.v1 v1.4.7 // indirect
+	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 )

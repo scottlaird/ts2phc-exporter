@@ -43,7 +43,7 @@ func ParseNMEALogEntry(sentence string, nd *NMEAData) {
 
 	s, err := nmeaParser.Parse(sentence)
 	if err != nil {
-		fmt.Printf("---> NMEA match failed: %v\n", err)
+		slog.Info("NMEA parser failed", "error", err)
 	} else {
 		switch s.DataType() {
 		case nmea.TypeGSA:
