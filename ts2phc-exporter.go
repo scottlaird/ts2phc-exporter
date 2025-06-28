@@ -3,14 +3,12 @@ package main
 import (
 	"bufio"
 	"flag"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os/exec"
 	"regexp"
 	"strconv"
 
-	"github.com/adrianmo/go-nmea"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -36,33 +34,9 @@ var (
 	freqSumSquared   prometheus.Counter
 )
 
-type SatConstellation struct {
-	Constellation string
-	Name          string
-	Band          string
-	Frequency     string
-}
-
-type NMEAData struct {
-	Sats                       []parser.SatData
-	SatCounts                  map[SatConstellation]int64
-	Locked                     bool
-	TotalSatellites            int64
-	PDOP, VDOP, HDOP, HDOP_GGA float64
-	Device                     string
-	Offset                     int
-	Freq                       int
-}
-
-// By default go-nmea refuses to parse any NMEA sentences without a
-// checksum.  This replaces the default checksum checker.
-func ignoreCNC(sentence nmea.BaseSentence, rawFields string) error {
-	return nil
-}
-
-func ResetNMEAData(nd *NMEAData) {
+func ResetNMEAData(nd *parser.NMEAData) {
 	nd.Sats = []parser.SatData{}
-	nd.SatCounts = make(map[SatConstellation]int64)
+	nd.SatCounts = make(map[parser.SatConstellation]int64)
 	nd.Locked = false
 	nd.TotalSatellites = 0
 	nd.PDOP = 0
@@ -71,7 +45,7 @@ func ResetNMEAData(nd *NMEAData) {
 	nd.HDOP_GGA = 0
 }
 
-func PublishNMEAData(nd *NMEAData) {
+func PublishNMEAData(nd *parser.NMEAData) {
 	//fmt.Printf("=> %+v\n", nd)
 
 	for c, v := range nd.SatCounts {
@@ -88,7 +62,7 @@ func PublishNMEAData(nd *NMEAData) {
 	if nd.TotalSatellites > 0 {
 		totalSatellites.Set(float64(nd.TotalSatellites))
 	} else {
-		totalSatellites.Set(float64(nd.SatCounts[SatConstellation{Constellation: "GPS", Name: "GPS", Band: "L1"}])) // Not a terrible fallback if we don't have GGA data.
+		totalSatellites.Set(float64(nd.SatCounts[parser.SatConstellation{Constellation: "GPS", Name: "GPS", Band: "L1"}])) // Not a terrible fallback if we don't have GGA data.
 	}
 	if nd.Locked {
 		satLocked.Set(1)
@@ -210,8 +184,6 @@ func main() {
 }
 
 func ReadLogs() {
-	unknownTypeSeen := make(map[string]bool)
-
 	slog.Info("Scanning ts2phc logs")
 	cmd := exec.Command("journalctl", "-u", "ts2phc", "-f")
 
@@ -227,13 +199,9 @@ func ReadLogs() {
 		return
 	}
 
-	nmeaParser := nmea.SentenceParser{
-		CheckCRC: ignoreCNC,
-	}
-
 	scanner := bufio.NewScanner(logs)
 
-	nd := &NMEAData{}
+	nd := &parser.NMEAData{}
 	ResetNMEAData(nd)
 
 	for scanner.Scan() {
@@ -241,59 +209,7 @@ func ReadLogs() {
 		slog.Debug("Scanning line", "line", line)
 
 		if nmeaMatch := nemaRE.FindStringSubmatch(line); nmeaMatch != nil {
-			sentence := "$" + nmeaMatch[1]
-
-			s, err := nmeaParser.Parse(sentence)
-			if err != nil {
-				fmt.Printf("---> NMEA match failed: %v\n", err)
-			} else {
-				switch s.DataType() {
-				case nmea.TypeGSA:
-					gsa := s.(nmea.GSA)
-					bd := parser.ParseBandDataWithSystemID(gsa.Talker, gsa.SystemID)
-					slog.Debug("Parsed GSA", "mode", gsa.Mode, "fixtype", gsa.FixType, "sv", gsa.SV, "pdop", gsa.PDOP, "hdop", gsa.HDOP, "vdop", gsa.VDOP, "system", bd.Name, "band", bd.Band)
-
-					nd.PDOP = gsa.PDOP
-					nd.VDOP = gsa.VDOP
-					nd.HDOP = gsa.HDOP
-				case nmea.TypeGSV:
-					gsv := s.(nmea.GSV)
-					bd := parser.ParseBandDataWithSystemID(gsv.Talker, gsv.SystemID)
-					var sats int64
-
-					slog.Debug("Parsed GSV", "seq", fmt.Sprintf("%d of %d", gsv.MessageNumber, gsv.TotalMessages), "numbersvsinview", gsv.NumberSVsInView, "info", gsv.Info, "system", bd.Name, "band", bd.Band)
-
-					for _, sv := range gsv.Info {
-						if sv.SNR > 0 {
-							sats++
-						}
-					}
-					if sats > 0 {
-						nd.SatCounts[SatConstellation{Constellation: bd.Constellation, Name: bd.Name, Band: bd.Band, Frequency: bd.Frequency}] += sats
-					}
-				case nmea.TypeRMC:
-					rmc := s.(nmea.RMC)
-					slog.Debug("Parsed RMC", "validity", rmc.Validity)
-					nd.Locked = rmc.Validity == "A"
-				case nmea.TypeGGA:
-					gga := s.(nmea.GGA)
-					slog.Debug("Parsed GGA", "fixquality", gga.FixQuality, "numsatellites", gga.NumSatellites, "hdop", gga.HDOP)
-
-					nd.TotalSatellites = gga.NumSatellites
-					nd.HDOP_GGA = gga.HDOP
-				case nmea.TypeTXT:
-					txt := s.(nmea.TXT)
-					slog.Debug("Parsed TXT", "seq", fmt.Sprintf("%d of %d", txt.Number, txt.TotalNumber), "message", txt.Message)
-				default:
-					if !unknownTypeSeen[s.DataType()] {
-						slog.Info("Received unknown NMEA message type, only logging once", "type", s.DataType())
-						unknownTypeSeen[s.DataType()] = true
-					} else {
-						slog.Debug("Received unknown NMEA message type, ignoring", "type", s.DataType())
-					}
-
-				}
-			}
+			parser.ParseNMEALogEntry(nmeaMatch[1], nd)
 		} else if offsetMatch := offsetRE.FindStringSubmatch(line); offsetMatch != nil {
 			slog.Debug("Offset", "device", offsetMatch[1], "offset", offsetMatch[2], "freq", offsetMatch[3])
 
