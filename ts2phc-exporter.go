@@ -25,7 +25,6 @@ var (
 	offsetRE = regexp.MustCompile(".*(/dev/ptp[0-9]+) offset +([-0-9]+) .* freq +([-+0-9]+)")
 
 	satCounts        *prometheus.GaugeVec
-	bandCounts       *prometheus.GaugeVec
 	satLocked        prometheus.Gauge
 	totalSatellites  prometheus.Gauge
 	PDOP, VDOP, HDOP prometheus.Gauge
@@ -123,14 +122,6 @@ func main() {
 		[]string{"constellation", "name", "band", "frequency"})
 	reg.MustRegister(satCounts)
 
-	bandCounts = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "ts2phc_band_counts",
-			Help: "Current number of satellites by band",
-		},
-		[]string{"band"})
-	reg.MustRegister(bandCounts)
-
 	satLocked = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "ts2phc_locked",
@@ -141,7 +132,7 @@ func main() {
 	totalSatellites = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "ts2phc_total_satellites",
-			Help: "Current number of satellites in view",
+			Help: "Current number of satellites used, according to the GNSS module.  This may be less than the sum of ts2phc_sat_counts, depending on the module.  F9Ts seem to limit this to 12, for instance.",
 		})
 	reg.MustRegister(totalSatellites)
 
