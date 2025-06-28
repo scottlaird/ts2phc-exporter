@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os/exec"
 	"regexp"
@@ -12,65 +13,19 @@ import (
 	"github.com/adrianmo/go-nmea"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/scottlaird/ts2phc-exporter/parser"
 )
 
 var (
-	debug       = flag.Bool("debug", false, "Enable debugging output")
-	nmeaVariant = flag.String("nmea_variant", "4.11", "Which NMEA version to speak.  Use 4.11 for ublox F9 and F10, and 4.10 for M8.")
+	debug         = flag.Bool("debug", false, "Enable debugging output")
+	listenAddress = flag.String("listen_address", ":8089", "Which HTTP port/address to listen on")
 
 	nemaRE   = regexp.MustCompile(".*nmea sentence: (.*)")
 	offsetRE = regexp.MustCompile(".*(/dev/ptp[0-9]+) offset +([-0-9]+) .* freq +([-+0-9]+)")
 
-	UBLOX_NMEA411 = map[string]string{
-		"GN 1": "GPS",
-		"GN 2": "GLONASS",
-		"GN 3": "Galileo",
-		"GN 4": "BeiDou",
-		"GN 5": "QZSS",
-		"GN 6": "NavIC",
-		"GP 0": "GPS x",
-		"GP 1": "GPS L1",
-		"GP 6": "GPS L2 CL",
-		"GP 5": "GPS L2 CM",
-		"GP 7": "GPS L5 I",
-		"GP 8": "GPS L6 Q",
-		"GL 0": "GLONASS unknown",
-		"GL 1": "GLONASS L1",
-		"GL 3": "GLONASS L2",
-		"GA 0": "Galileo unknown",
-		"GA 1": "Galileo E5 aI/aQ",
-		"GA 2": "Galileo E5 bI/bQ",
-		"GA 4": "Galileo E6 A",
-		"GA 5": "Galileo E6 B/C",
-		"GA 7": "Galileo E1 B/C",
-		"GB 0": "BeiDou unknown",
-		"GB 1": "BeiDou B1 D1/D2",
-		"GB 3": "BeiDou B1 Cp",
-		"GB 5": "BeiDou B2 ad/ap",
-		"GB 8": "BeiDou B2I/B3I",
-		//"GP 1": "SBAS L1C/A",
-		"GQ 0": "QZSS unknown",
-		"GQ 1": "QZSS L1C/A",
-		"GQ 4": "QZSS L1S",
-		"GQ 5": "QZSS L2 CM",
-		"GQ 6": "QZSS L2 CL",
-		"GQ 7": "QZSS L5 I",
-		"GQ 8": "QZSS L5 Q",
-		"GI 0": "NavIC unknown",
-		"GI 1": "NavIC L5 A",
-	}
-	UBLOX_NMEA410 = map[string]string{
-		"GN": "Generic GNSS",
-		"GP": "GPS",
-		"GL": "GLONASS",
-		"GA": "Galileo",
-		"GB": "BeiDou",
-		"GQ": "QZSS",
-		"GI": "NavIC",
-	}
-
-	satAzElevCounts  *prometheus.CounterVec
 	satCounts        *prometheus.GaugeVec
+	bandCounts       *prometheus.GaugeVec
 	satLocked        prometheus.Gauge
 	totalSatellites  prometheus.Gauge
 	PDOP, VDOP, HDOP prometheus.Gauge
@@ -82,48 +37,16 @@ var (
 	freqSumSquared   prometheus.Counter
 )
 
-// By default go-nmea refuses to parse any NMEA sentences without a
-// checksum.  This replaces the default checksum checker.
-func ignoreCNC(sentence nmea.BaseSentence, rawFields string) error {
-	return nil
-}
-
-// This really needs to be flagged by receiver vendor and/or NMEA rev.
-// Assuming Ublox / NMEA 4.11 for now.
-//
-// We need two pieces of info to decode this:
-//
-// 1.  We need the first 2 bytes of the NMEA message
-// 2.  The system ID from the GSV, etc message.
-//
-// If the systemID is 0, then I think we're seeing "we used to see
-// these sats but lost them" update.
-func systemIDName(sentence string, systemID int64) string {
-	switch *nmeaVariant {
-	case "4.10":
-		key := sentence[1:3]
-		if v, ok := UBLOX_NMEA410[key]; ok {
-			return v
-		}
-
-		return key
-
-	case "4.11":
-		key := fmt.Sprintf("%s %d", sentence[1:3], systemID)
-		if v, ok := UBLOX_NMEA411[key]; ok {
-			return v
-		}
-
-		// Not a huge fan of this here.
-		return key
-	default:
-		return sentence[1:3]
-	}
+type SatConstellation struct {
+	Constellation string
+	Name          string
+	Band          string
+	Frequency     string
 }
 
 type NMEAData struct {
-	SatAzElevCounts            map[string]map[string]int
-	SatCounts                  map[string]int64
+	Sats                       []parser.SatData
+	SatCounts                  map[SatConstellation]int64
 	Locked                     bool
 	TotalSatellites            int64
 	PDOP, VDOP, HDOP, HDOP_GGA float64
@@ -132,9 +55,15 @@ type NMEAData struct {
 	Freq                       int
 }
 
+// By default go-nmea refuses to parse any NMEA sentences without a
+// checksum.  This replaces the default checksum checker.
+func ignoreCNC(sentence nmea.BaseSentence, rawFields string) error {
+	return nil
+}
+
 func ResetNMEAData(nd *NMEAData) {
-	nd.SatAzElevCounts = make(map[string]map[string]int)
-	nd.SatCounts = make(map[string]int64)
+	nd.Sats = []parser.SatData{}
+	nd.SatCounts = make(map[SatConstellation]int64)
 	nd.Locked = false
 	nd.TotalSatellites = 0
 	nd.PDOP = 0
@@ -147,13 +76,7 @@ func PublishNMEAData(nd *NMEAData) {
 	//fmt.Printf("=> %+v\n", nd)
 
 	for c, v := range nd.SatCounts {
-		satCounts.With(prometheus.Labels{"constellation": c}).Set(float64(v))
-	}
-
-	for a, ec := range nd.SatAzElevCounts {
-		for e, v := range ec {
-			satAzElevCounts.With(prometheus.Labels{"az": a, "elev": e}).Add(float64(v))
-		}
+		satCounts.With(prometheus.Labels{"constellation": c.Constellation, "name": c.Name, "band": c.Band, "frequency": c.Frequency}).Set(float64(v))
 	}
 
 	PDOP.Set(nd.PDOP)
@@ -166,7 +89,7 @@ func PublishNMEAData(nd *NMEAData) {
 	if nd.TotalSatellites > 0 {
 		totalSatellites.Set(float64(nd.TotalSatellites))
 	} else {
-		totalSatellites.Set(float64(nd.SatCounts["GPS"])) // Not a terrible fallback if we don't have GGA data.
+		totalSatellites.Set(float64(nd.SatCounts[SatConstellation{Constellation: "GPS", Name: "GPS", Band: "L1"}])) // Not a terrible fallback if we don't have GGA data.
 	}
 	if nd.Locked {
 		satLocked.Set(1)
@@ -186,23 +109,27 @@ func PublishNMEAData(nd *NMEAData) {
 func main() {
 	flag.Parse()
 
-	reg := prometheus.NewRegistry()
+	if *debug {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
 
-	satAzElevCounts = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ts2phc_sat_az_elev_counts",
-			Help: "Number of satellites seen at each azimuth and elevation",
-		},
-		[]string{"az", "elev"})
-	reg.MustRegister(satAzElevCounts)
+	reg := prometheus.NewRegistry()
 
 	satCounts = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "ts2phc_sat_counts",
 			Help: "Current number of satellites by constellation",
 		},
-		[]string{"constellation"})
+		[]string{"constellation", "name", "band", "frequency"})
 	reg.MustRegister(satCounts)
+
+	bandCounts = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ts2phc_band_counts",
+			Help: "Current number of satellites by band",
+		},
+		[]string{"band"})
+	reg.MustRegister(bandCounts)
 
 	satLocked = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -284,20 +211,29 @@ func main() {
 	go ReadLogs()
 
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
-	http.ListenAndServe(":8089", nil)
+	slog.Info("Starting HTTP listener, listening for /metrics", "address", *listenAddress)
+	err := http.ListenAndServe(*listenAddress, nil)
+	if err != nil {
+		slog.Error("HTTP server failed", "error", err)
+	}
 }
 
 func ReadLogs() {
+	unknownTypeSeen := make(map[string]bool)
+
+	slog.Info("Scanning ts2phc logs")
 	cmd := exec.Command("journalctl", "-u", "ts2phc", "-f")
 
 	logs, err := cmd.StdoutPipe()
 	if err != nil {
-		panic(err)
+		slog.Error("Failed to create journalctl pipe", "error", err)
+		return
 	}
 
 	err = cmd.Start()
 	if err != nil {
-		panic(err)
+		slog.Error("Failed to run journalctl", "error", err)
+		return
 	}
 
 	nmeaParser := nmea.SentenceParser{
@@ -311,9 +247,7 @@ func ReadLogs() {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if *debug {
-			fmt.Printf("-> %s\n", line)
-		}
+		slog.Debug("Scanning line", "line", line)
 
 		if nmeaMatch := nemaRE.FindStringSubmatch(line); nmeaMatch != nil {
 			sentence := "$" + nmeaMatch[1]
@@ -325,59 +259,52 @@ func ReadLogs() {
 				switch s.DataType() {
 				case nmea.TypeGSA:
 					gsa := s.(nmea.GSA)
-					if *debug {
-						fmt.Printf("---> GSA: mode=%s fixtype=%s SV=%v pdop=%f hdop=%f vdop=%f systemID=%s\n", gsa.Mode, gsa.FixType, gsa.SV, gsa.PDOP, gsa.HDOP, gsa.VDOP, systemIDName(sentence, gsa.SystemID))
-					}
+					bd := parser.ParseBandDataWithSystemID(gsa.Talker, gsa.SystemID)
+					slog.Debug("Parsed GSA", "mode", gsa.Mode, "fixtype", gsa.FixType, "sv", gsa.SV, "pdop", gsa.PDOP, "hdop", gsa.HDOP, "vdop", gsa.VDOP, "system", bd.Name, "band", bd.Band)
+
 					nd.PDOP = gsa.PDOP
 					nd.VDOP = gsa.VDOP
 					nd.HDOP = gsa.HDOP
 				case nmea.TypeGSV:
 					gsv := s.(nmea.GSV)
-					if *debug {
-						fmt.Printf("---> GSV: %d/%d numbersvsinview=%d info=%v systemID=%s\n", gsv.MessageNumber, gsv.TotalMessages, gsv.NumberSVsInView, gsv.Info, systemIDName(sentence, gsv.SystemID))
-					}
+					bd := parser.ParseBandDataWithSystemID(gsv.Talker, gsv.SystemID)
+					var sats int64
 
-					if *nmeaVariant == "4.10" || gsv.SystemID != 0 {
-						for _, sv := range gsv.Info {
-							az := strconv.Itoa(int(sv.Azimuth))
-							elev := strconv.Itoa(int(sv.Elevation))
+					slog.Debug("Parsed GSV", "seq", fmt.Sprintf("%d of %d", gsv.MessageNumber, gsv.TotalMessages), "numbersvsinview", gsv.NumberSVsInView, "info", gsv.Info, "system", bd.Name, "band", bd.Band)
 
-							if _, ok := nd.SatAzElevCounts[az]; !ok {
-								nd.SatAzElevCounts[az] = make(map[string]int)
-							}
-							nd.SatAzElevCounts[az][elev]++
+					for _, sv := range gsv.Info {
+						if sv.SNR > 0 {
+							sats++
 						}
-						nd.SatCounts[systemIDName(sentence, gsv.SystemID)] = gsv.NumberSVsInView
+					}
+					if sats > 0 {
+						nd.SatCounts[SatConstellation{Constellation: bd.Constellation, Name: bd.Name, Band: bd.Band, Frequency: bd.Frequency}] += sats
 					}
 				case nmea.TypeRMC:
 					rmc := s.(nmea.RMC)
-					if *debug {
-						fmt.Printf("---> RMC: validity=%s\n", rmc.Validity)
-					}
+					slog.Debug("Parsed RMC", "validity", rmc.Validity)
 					nd.Locked = rmc.Validity == "A"
 				case nmea.TypeGGA:
 					gga := s.(nmea.GGA)
-					if *debug {
-						fmt.Printf("---> GGA: fixquality=%s numsatellites=%d hdop=%f separation=%f\n", gga.FixQuality, gga.NumSatellites, gga.HDOP, gga.Separation)
-					}
+					slog.Debug("Parsed GGA", "fixquality", gga.FixQuality, "numsatellites", gga.NumSatellites, "hdop", gga.HDOP)
 
 					nd.TotalSatellites = gga.NumSatellites
 					nd.HDOP_GGA = gga.HDOP
 				case nmea.TypeTXT:
 					txt := s.(nmea.TXT)
-					if *debug {
-						fmt.Printf("---> TXT: %d/%d %q\n", txt.Number, txt.TotalNumber, txt.Message)
-					}
+					slog.Debug("Parsed TXT", "seq", fmt.Sprintf("%d of %d", txt.Number, txt.TotalNumber), "message", txt.Message)
 				default:
-					if *debug {
-						fmt.Printf("---> got NMEA type %s\n", s.DataType())
+					if !unknownTypeSeen[s.DataType()] {
+						slog.Info("Received unknown NMEA message type, only logging once", "type", s.DataType())
+						unknownTypeSeen[s.DataType()] = true
+					} else {
+						slog.Debug("Received unknown NMEA message type, ignoring", "type", s.DataType())
 					}
+
 				}
 			}
 		} else if offsetMatch := offsetRE.FindStringSubmatch(line); offsetMatch != nil {
-			if *debug {
-				fmt.Printf("--> Offset: %s | %s | %s\n", offsetMatch[1], offsetMatch[2], offsetMatch[3])
-			}
+			slog.Debug("Offset", "device", offsetMatch[1], "offset", offsetMatch[2], "freq", offsetMatch[3])
 
 			nd.Device = offsetMatch[1]
 			nd.Offset, _ = strconv.Atoi(offsetMatch[2])
@@ -387,9 +314,10 @@ func ReadLogs() {
 			ResetNMEAData(nd)
 		} else {
 			if *debug {
-				fmt.Printf("--> no match: %s\n", line)
+				slog.Debug("Unknown log line", "line", line)
 			}
 		}
 
 	}
+	slog.Error("scan loop finished")
 }
