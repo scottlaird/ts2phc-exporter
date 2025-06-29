@@ -4,10 +4,9 @@ This is a Prometheus exporter for `ts2phc`, a part of the LinuxPTP
 project.  It currently reads ts2phc logs via journalctl and exports
 /metrics on port 8089.
 
-This is a work in progress.  It's not done, it's full of debugging
-code, it doesn't have flags for any of the things that should have
-flags (like the HTTP port number!), and its NMEA parsing is still
-weak.  But it works for me.
+This is a work in progress, but it's getting closer to being complete.
+I'm using it with 4 different systems, with 1x ublox M8T, 2x F9T, and
+1x F10.  Other GNSS modules should work but are untested.
 
 ## Installing
 
