@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/adrianmo/go-nmea"
 	"log/slog"
+	"time"
 )
 
 var (
@@ -17,7 +18,19 @@ type SatConstellation struct {
 	Frequency     string
 }
 
+type SatMetric struct {
+	Constellation string
+	ConName       string
+	ConBand       string
+	ConFrequency  string
+	SatID         int
+	Azimuth       int
+	Elevation     int
+	SNR           int
+}
+
 type NMEAData struct {
+	Timestamp                  *time.Time
 	Sats                       []SatData
 	SatCounts                  map[SatConstellation]int64
 	Locked                     bool
@@ -26,6 +39,7 @@ type NMEAData struct {
 	Device                     string
 	Offset                     int
 	Freq                       int
+	SatMetrics                 []SatMetric
 }
 
 // By default go-nmea refuses to parse any NMEA sentences without a
@@ -39,6 +53,11 @@ func ParseNMEALogEntry(sentence string, nd *NMEAData) {
 
 	nmeaParser := nmea.SentenceParser{
 		CheckCRC: ignoreCNC,
+	}
+
+	if nd.Timestamp == nil {
+		t := time.Now()
+		nd.Timestamp = &t
 	}
 
 	s, err := nmeaParser.Parse(sentence)
@@ -65,6 +84,17 @@ func ParseNMEALogEntry(sentence string, nd *NMEAData) {
 				if sv.SNR > 0 {
 					sats++
 				}
+				sm := SatMetric{
+					Constellation: bd.Constellation,
+					ConName:       bd.Name,
+					ConBand:       bd.Band,
+					ConFrequency:  bd.Frequency,
+					SatID:         int(sv.SVPRNNumber),
+					Azimuth:       int(sv.Azimuth),
+					Elevation:     int(sv.Elevation),
+					SNR:           int(sv.SNR),
+				}
+				nd.SatMetrics = append(nd.SatMetrics, sm)
 			}
 			if sats > 0 {
 				nd.SatCounts[SatConstellation{Constellation: bd.Constellation, Name: bd.Name, Band: bd.Band, Frequency: bd.Frequency}] += sats
