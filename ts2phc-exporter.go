@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"database/sql"
 	"flag"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -12,6 +15,10 @@ import (
 	"github.com/hpcloud/tail"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	_ "github.com/ClickHouse/clickhouse-go/v2"
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/scottlaird/ts2phc-exporter/parser"
 )
@@ -21,6 +28,9 @@ var (
 	listenAddress  = flag.String("listen_address", ":8089", "Which HTTP port/address to listen on")
 	journalctlUnit = flag.String("u", "ts2phc", "Systemd journal unit to read for ts2phc logs")
 	logfile        = flag.String("logfile", "", "Logfile to read for ts2phc logs (overrides journalctl default)")
+	receiver       = flag.String("receiver", "", "System or GPS receiver label for database logging, uses hostname by default")
+	antenna        = flag.String("antenna", "", "Antenna label for database logging.")
+	dbtable        = flag.String("dbtable", "", "Database table for logging.  If blank, then no db logging.")
 
 	nemaRE   = regexp.MustCompile(".*nmea sentence: (.*)")
 	offsetRE = regexp.MustCompile(".*(/dev/ptp[0-9]+) offset +([-0-9]+) .* freq +([-+0-9]+)")
@@ -39,6 +49,7 @@ var (
 
 func ResetNMEAData(nd *parser.NMEAData) {
 	nd.Sats = []parser.SatData{}
+	nd.SatMetrics = []parser.SatMetric{}
 	nd.SatCounts = make(map[parser.SatConstellation]int64)
 	nd.Locked = false
 	nd.TotalSatellites = 0
@@ -48,7 +59,7 @@ func ResetNMEAData(nd *parser.NMEAData) {
 	nd.HDOP_GGA = 0
 }
 
-func PublishNMEAData(nd *parser.NMEAData) {
+func PublishNMEAData(ctx context.Context, db *sql.DB, nd *parser.NMEAData) error {
 	//fmt.Printf("=> %+v\n", nd)
 
 	for c, v := range nd.SatCounts {
@@ -80,6 +91,41 @@ func PublishNMEAData(nd *parser.NMEAData) {
 	freqCount.Inc()
 	freqSum.Add(float64(nd.Freq))
 	freqSumSquared.Add(float64(nd.Freq * nd.Freq))
+
+	if db != nil {
+		query := "INSERT INTO " + *dbtable +
+			"(timestamp, constellation, name, band, frequency, satelliteid, antenna, receiver, azimuth, elev, snr) values " +
+			"(?,         ?,             ?,    ?,    ?,         ?,           ?,       ?,        ?,       ?,    ?)"
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			slog.Error("Unable to begin DB transaction", "error", err)
+			return err
+		}
+		defer tx.Rollback()
+
+		stmt, err := tx.PrepareContext(ctx, query)
+		if err != nil {
+			slog.Error("Unable to prepare statement", "error", err)
+			return err
+		}
+
+		for _, sat := range nd.SatMetrics {
+			_, err = stmt.ExecContext(ctx, nd.Timestamp, sat.Constellation, sat.ConName, sat.ConBand, sat.ConFrequency, sat.SatID, *antenna, *receiver, sat.Azimuth, sat.Elevation, sat.SNR)
+			if err != nil {
+				slog.Error("Unable to insert into db", "error", err)
+				return err
+			}
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			slog.Error("Failed to commit transaction", "error", err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 func main() {
@@ -87,6 +133,11 @@ func main() {
 
 	if *debug {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	// If --receiver isn't specified, then try to use the hostname.
+	if *receiver == "" {
+		*receiver, _ = os.Hostname()
 	}
 
 	reg := prometheus.NewRegistry()
@@ -176,17 +227,26 @@ func main() {
 		})
 	reg.MustRegister(freqSumSquared)
 
-	go ReadLogs()
+	var db *sql.DB
+	var err error
+	if *dbtable != "" {
+		db, err = sql.Open(os.Getenv("DB_DRIVER"), os.Getenv("DSN"))
+		if err != nil {
+			slog.Error("Unable to open database", "error", err)
+		}
+	}
+
+	go ReadLogs(context.Background(), db)
 
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
 	slog.Info("Starting HTTP listener, listening for /metrics", "address", *listenAddress)
-	err := http.ListenAndServe(*listenAddress, nil)
+	err = http.ListenAndServe(*listenAddress, nil)
 	if err != nil {
 		slog.Error("HTTP server failed", "error", err)
 	}
 }
 
-func ReadLogs() {
+func ReadLogs(ctx context.Context, db *sql.DB) {
 	var scanner *bufio.Scanner
 	nd := &parser.NMEAData{}
 	ResetNMEAData(nd)
@@ -200,7 +260,7 @@ func ReadLogs() {
 		slog.Info("Scanning logfile", "logfile", *logfile)
 
 		for line := range t.Lines {
-			ParseLine(line.Text, nd)
+			ParseLine(ctx, db, line.Text, nd)
 		}
 
 	} else {
@@ -222,14 +282,14 @@ func ReadLogs() {
 		scanner = bufio.NewScanner(logs)
 		for scanner.Scan() {
 			line := scanner.Text()
-			ParseLine(line, nd)
+			ParseLine(ctx, db, line, nd)
 		}
 	}
 
 	slog.Error("scan loop finished")
 }
 
-func ParseLine(line string, nd *parser.NMEAData) {
+func ParseLine(ctx context.Context, db *sql.DB, line string, nd *parser.NMEAData) {
 	slog.Debug("Scanning line", "line", line)
 
 	if nmeaMatch := nemaRE.FindStringSubmatch(line); nmeaMatch != nil {
@@ -241,7 +301,7 @@ func ParseLine(line string, nd *parser.NMEAData) {
 		nd.Offset, _ = strconv.Atoi(offsetMatch[2])
 		nd.Freq, _ = strconv.Atoi(offsetMatch[3])
 
-		PublishNMEAData(nd)
+		PublishNMEAData(ctx, db, nd)
 		ResetNMEAData(nd)
 	} else {
 		if *debug {
